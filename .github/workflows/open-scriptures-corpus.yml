@@ -1,0 +1,27 @@
+name: Open Scriptures Corpus Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - build_selected.py
+      - .github/workflows/open-scriptures-corpus.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned Japanese selections
+        run: python build_selected.py
+      - name: Commit generated result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add japanese-selected.json BUILD_REPORT.txt
+          git diff --cached --quiet || git commit -m "Generate pinned Japanese scripture selections"
+          git push
