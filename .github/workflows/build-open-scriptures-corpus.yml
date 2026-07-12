@@ -1,0 +1,145 @@
+name: Build Open Scriptures Corpus
+
+on:
+  push:
+    branches:
+      - open-scriptures-corpus-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  build-corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out build branch
+        uses: actions/checkout@v4
+
+      - name: Fetch independent Kougo corpus sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/scrollmapper/bible_databases.git source-scrollmapper
+          git clone --depth 1 https://github.com/churchstudio-org/openbible.git source-openbible
+          mkdir -p artifact
+          cp source-scrollmapper/formats/json/JapKougo.json artifact/JapKougo.scrollmapper.json
+          cp source-openbible/KOUGO_YAKU/bible.json artifact/JapKougo.openbible.json
+          git -C source-scrollmapper rev-parse HEAD > artifact/scrollmapper-commit.txt
+          git -C source-openbible rev-parse HEAD > artifact/openbible-commit.txt
+
+      - name: Compare every verse and lock hashes
+        shell: bash
+        run: |
+          cat > /tmp/audit.py <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          out = Path('artifact')
+          a_path = out / 'JapKougo.scrollmapper.json'
+          b_path = out / 'JapKougo.openbible.json'
+          a_raw = a_path.read_bytes()
+          b_raw = b_path.read_bytes()
+          a = json.loads(a_raw.decode('utf-8-sig'))
+          b = json.loads(b_raw.decode('utf-8-sig'))
+
+          def git_blob_sha1(raw: bytes) -> str:
+              return hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest()
+
+          a_verses = []
+          chapter_counts = []
+          for book_index, book in enumerate(a['books'], start=1):
+              book_count = 0
+              for chapter in book['chapters']:
+                  verses = chapter['verses']
+                  chapter_counts.append({
+                      'bookIndex': book_index,
+                      'bookName': book['name'],
+                      'chapter': int(chapter['chapter']),
+                      'verseCount': len(verses),
+                  })
+                  for verse in verses:
+                      a_verses.append((book_index, int(chapter['chapter']), int(verse['verse']), verse['text']))
+                      book_count += 1
+
+          b_verses = []
+          for book_index, book in enumerate(b, start=1):
+              for chapter_index, chapter in enumerate(book, start=1):
+                  for verse_index, text in enumerate(chapter, start=1):
+                      b_verses.append((book_index, chapter_index, verse_index, text))
+
+          b_index = {(x[0], x[1], x[2]): x[3] for x in b_verses}
+          mismatches = []
+          missing = []
+          for book, chapter, verse, text in a_verses:
+              other = b_index.get((book, chapter, verse))
+              if other is None:
+                  missing.append({'book': book, 'chapter': chapter, 'verse': verse, 'side': 'openbible'})
+              elif text != other:
+                  mismatches.append({
+                      'book': book,
+                      'chapter': chapter,
+                      'verse': verse,
+                      'scrollmapper': text,
+                      'openbible': other,
+                  })
+
+          a_index = {(x[0], x[1], x[2]): x[3] for x in a_verses}
+          for book, chapter, verse, text in b_verses:
+              if (book, chapter, verse) not in a_index:
+                  missing.append({'book': book, 'chapter': chapter, 'verse': verse, 'side': 'scrollmapper'})
+
+          report = {
+              'translationMetadata': a.get('translation'),
+              'scrollmapper': {
+                  'verseCount': len(a_verses),
+                  'sha256': hashlib.sha256(a_raw).hexdigest(),
+                  'gitBlobSha1': git_blob_sha1(a_raw),
+                  'commit': (out / 'scrollmapper-commit.txt').read_text().strip(),
+              },
+              'openbible': {
+                  'verseCount': len(b_verses),
+                  'sha256': hashlib.sha256(b_raw).hexdigest(),
+                  'gitBlobSha1': git_blob_sha1(b_raw),
+                  'commit': (out / 'openbible-commit.txt').read_text().strip(),
+              },
+              'comparison': {
+                  'allVerseKeysMatched': not missing,
+                  'exactTextMatchCount': len(a_verses) - len(mismatches) - sum(1 for x in missing if x['side'] == 'openbible'),
+                  'mismatchCount': len(mismatches),
+                  'missingCount': len(missing),
+                  'mismatchSample': mismatches[:50],
+                  'missingSample': missing[:50],
+              },
+              'chapterCounts': chapter_counts,
+          }
+          (out / 'CORPUS_AUDIT.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'README.txt').write_text(
+              'Japanese Kougo-yaku corpus build artifact.\n'
+              'Primary source: scrollmapper/bible_databases formats/json/JapKougo.json\n'
+              'Independent comparison: churchstudio-org/openbible KOUGO_YAKU/bible.json\n'
+              'See CORPUS_AUDIT.json for hashes and full-corpus comparison totals.\n',
+              encoding='utf-8',
+          )
+
+          expected = 'ce0d21f49a8d6284088f367503bc29761c5b73b1'
+          actual = report['scrollmapper']['gitBlobSha1']
+          if actual != expected:
+              raise SystemExit(f'Pinned scrollmapper Git blob SHA-1 mismatch: {actual}')
+          if missing:
+              raise SystemExit(f'Corpus key mismatch: {len(missing)} missing entries')
+          print(json.dumps(report['comparison'], ensure_ascii=False, indent=2))
+          PY
+          python /tmp/audit.py
+
+      - name: Upload verified corpus artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kougo-corpus-verified
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
